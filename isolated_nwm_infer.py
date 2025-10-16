@@ -19,7 +19,7 @@ from diffusers.models import AutoencoderKL
 import misc
 import distributed as dist
 from models import CDiT_models
-from datasets import EvalDataset
+from datasets_nwm import EvalDataset
 from PIL import Image
 
 
@@ -63,6 +63,56 @@ def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
     return dataset
 
 @torch.no_grad()
+def model_forward_wrapper_ours(
+        all_models, 
+        curr_obs, 
+        curr_delta, 
+        num_timesteps, 
+        latent_size, 
+        device, 
+        num_cond, 
+        num_goals=1, 
+        rel_t=None, 
+        progress=False,
+        num_samples=5,
+    ):
+    model, diffusion, vae = all_models
+    x = curr_obs.to(device)
+    y = curr_delta.to(device)
+
+    with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+        B, T = x.shape[:2]
+
+        if rel_t is None:
+            rel_t = (torch.ones(B)* (1. / 128.)).to(device)
+            rel_t *= num_timesteps
+
+        x = x.flatten(0,1)
+        x = vae.encode(x).latent_dist.sample().mul_(0.18215).unflatten(0, (B, T))
+        x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
+        
+        # Expand x_cond and y to account for num_samples
+        x_cond = x_cond.unsqueeze(1).expand(B*num_goals, num_samples, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
+        y = y.flatten(0, 1)
+        y = y.unsqueeze(1).expand(B*num_goals, num_samples, -1).flatten(0, 1)
+        rel_t = rel_t.unsqueeze(1).expand(B, num_samples).flatten(0, 1)
+        
+        z = torch.randn(B*num_goals*num_samples, 4, latent_size, latent_size, device=device)
+        model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)      
+        samples = diffusion.p_sample_loop(
+                model.forward, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=progress, device=device
+        )
+        samples = vae.decode(samples / 0.18215).sample  # (B*num_goals*num_samples, 3, 224, 224)
+        samples = torch.clip(samples, -1., 1.)
+        
+        # Reshape to (B*num_goals, num_samples, 3, 224, 224) and average over num_samples
+        samples = samples.unflatten(0, (B*num_goals, num_samples))
+        samples = samples.mean(dim=1)  # (B*num_goals, 3, 224, 224)
+
+        return samples
+    
+
+@torch.no_grad()
 def model_forward_wrapper(all_models, curr_obs, curr_delta, num_timesteps, latent_size, device, num_cond, num_goals=1, rel_t=None, progress=False):
     model, diffusion, vae = all_models
     x = curr_obs.to(device)
@@ -83,10 +133,10 @@ def model_forward_wrapper(all_models, curr_obs, curr_delta, num_timesteps, laten
         model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)      
         samples = diffusion.p_sample_loop(
                 model.forward, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=progress, device=device
-        )
+        ) # same shape as z, (b, 4, 28, 28)
         samples = vae.decode(samples / 0.18215).sample
 
-        return torch.clip(samples, -1., 1.)
+        return torch.clip(samples, -1., 1.) # B, 3, 224, 224
 
 def generate_rollout(args, output_dir, rollout_fps, idxs, all_models, obs_image, gt_image, delta, num_cond, device):
     rollout_stride = args.input_fps // rollout_fps

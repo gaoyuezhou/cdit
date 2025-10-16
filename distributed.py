@@ -7,7 +7,7 @@
 #
 import torch
 import torch.distributed as dist
-from torcheval.metrics import FrechetInceptionDistance
+# from torcheval.metrics import FrechetInceptionDistance
 
 from collections import defaultdict, deque
 import os

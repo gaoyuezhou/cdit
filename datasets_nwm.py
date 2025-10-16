@@ -50,6 +50,9 @@ class BaseDataset(Dataset):
         if "" in self.traj_names:
             self.traj_names.remove("")
 
+        # self.traj_names = self.traj_names[:500]
+        
+        # import pdb; pdb.set_trace()
         self.image_size = image_size
         self.distance_categories = list(range(min_dist_cat, max_dist_cat + 1))
         self.min_dist_cat = self.distance_categories[0]

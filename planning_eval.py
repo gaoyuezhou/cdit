@@ -26,7 +26,7 @@ import evo.main_rpe as main_rpe
 from evo.core.metrics import PoseRelation
 
 from diffusion import create_diffusion
-from datasets import TrajectoryEvalDataset
+from datasets_nwm import TrajectoryEvalDataset
 from isolated_nwm_infer import model_forward_wrapper
 from misc import calculate_delta_yaw, get_action_torch, save_planning_pred, log_viz_single, transform, unnormalize_data
 from isolated_nwm_eval import save_metric_to_disk

@@ -8,7 +8,7 @@
 # NoMaD, GNM, ViNT: https://github.com/robodhruv/visualnav-transformer
 # --------------------------------------------------------
 
-from isolated_nwm_infer import model_forward_wrapper
+from isolated_nwm_infer import model_forward_wrapper, model_forward_wrapper_ours
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -24,6 +24,7 @@ import logging
 import os
 import matplotlib.pyplot as plt 
 import yaml
+from tqdm import tqdm
 
 
 import torch.distributed as dist
@@ -35,8 +36,14 @@ from diffusers.models import AutoencoderKL
 from distributed import init_distributed
 from models import CDiT_models
 from diffusion import create_diffusion
-from datasets import TrainingDataset
+from datasets_nwm import TrainingDataset
 from misc import transform
+
+# import sys
+# sys.path.insert(0,'/home/gaoyuezhou/dev/dino_wm_private_hierarchical')
+
+from datasets.pusht_dset import PushTDataset, load_pusht_slice_train_val
+
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -99,10 +106,15 @@ def main(args):
 
     # Setup DDP:
     _, rank, device, _ = init_distributed()
+
+    print(f"[Rank {dist.get_rank()}] Node: {os.uname().nodename}, "
+      f"LOCAL_RANK={os.environ.get('LOCAL_RANK')}, "
+      f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    
     # rank = dist.get_rank()
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}, on device={device}")
     with open("config/eval_config.yaml", "r") as f:
         default_config = yaml.safe_load(f)
     config = default_config
@@ -195,7 +207,8 @@ def main(args):
             if data_split_type in data_config:
                     goals_per_obs = int(data_config["goals_per_obs"])
                     if data_split_type == 'test':
-                        goals_per_obs = 4 # standardize testing
+                        # goals_per_obs = 4 # standardize testing
+                        goals_per_obs = 1 
                     
                     if "distance" in data_config:
                         min_dist_cat=data_config["distance"]["min_dist_cat"]
@@ -252,7 +265,67 @@ def main(args):
         drop_last=True,
         persistent_workers=True
     )
+
+    # loader = torch.utils.data.DataLoader(
+    #         train_dataset,
+    #         batch_size=4,
+    #         shuffle=False, # already shuffled in TrajSlicerDataset
+    #         num_workers=12,
+    #         collate_fn=None,
+    #     )
     logger.info(f"Dataset contains {len(train_dataset):,} images")
+
+    from datasets.img_transforms import default_transform
+    transform2 = default_transform()
+    datasets, traj_dsets = load_pusht_slice_train_val(
+        data_path = '/checkpoint/amaia/video/gzhou/datasets/pusht_noise', 
+        with_velocity=True,
+        normalizer_type='mean_std', # doesn't matter
+        use_sin_cos=True,
+        n_rollout=None,
+        num_hist=1,
+        num_pred=1,
+        frameskip=25,
+        transform=transform2,
+        state_based=False,
+    )
+    # dataloaders = {
+    #     x: torch.utils.data.DataLoader(
+    #         datasets[x],
+    #         batch_size=4,
+    #         shuffle=False, # already shuffled in TrajSlicerDataset
+    #         num_workers=12,
+    #         collate_fn=None,
+    #     )
+    #     for x in ["train", "valid"]
+    # }
+    samplers = {
+        x:
+            DistributedSampler(
+                datasets[x],
+                num_replicas=dist.get_world_size(),
+                rank=rank,
+                shuffle=False,
+                seed=args.global_seed
+            )
+        for x in ["train", "valid"]
+    }
+
+    dataloaders = {
+        x: DataLoader(
+            datasets[x],
+            batch_size=config['batch_size'],
+            shuffle=False,
+            sampler=samplers[x],
+            num_workers=config['num_workers'],
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True
+        )
+        for x in ["train", "valid"]
+    }
+    
+
 
     # Prepare models for training:
     model.train()  # important! This enables embedding dropout for classifier-free guidance
@@ -268,24 +341,36 @@ def main(args):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
 
-        for x, y, rel_t in loader:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            rel_t = rel_t.to(device, non_blocking=True)
+    # for x, y, rel_t in loader:
+        # count = 0
+        # for x, y, rel_t in tqdm(loader, desc=f"Epoch {epoch} [train]", disable=(rank != 0), total=len(loader)):
+        for x, y, z in tqdm(dataloaders['train'], desc=f"Epoch {epoch} [train]", disable=(rank != 0), total=len(dataloaders['train'])):
+            x = x['visual']
+            x = x.to(device, non_blocking=True) # B, T, C, H, W
+            y = y.to(device, non_blocking=True) # B, T/2, 3
+            # change y to all zeros
+            y = torch.zeros(y.shape[0], y.shape[1], 3).to(device)
+            rel_t = torch.zeros(y.shape[0], 1).to(device)
+            # count += 1
+            # print(f'count: ', count)
+            # import pdb; pdb.set_trace()
+            # rel_t = rel_t.to(device, non_blocking=True)
             
             with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
                     B, T = x.shape[:2]
                     x = x.flatten(0,1)
-                    x = tokenizer.encode(x).latent_dist.sample().mul_(0.18215)
+                    x = tokenizer.encode(x).latent_dist.sample().mul_(0.18215) # _, 4, 28, 28
                     x = x.unflatten(0, (B, T))
                 
                 num_goals = T - num_cond
                 x_start = x[:, num_cond:].flatten(0, 1)
                 x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
-                y = y.flatten(0, 1)
+                # y = y.flatten(0, 1)
+                y = y[:, num_cond:].flatten(0, 1)
                 rel_t = rel_t.flatten(0, 1)
+                # import pdb; pdb.set_trace()
                 
                 t = torch.randint(0, diffusion.num_timesteps, (x_start.shape[0],), device=device)
                 model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
@@ -349,7 +434,8 @@ def main(args):
             if train_steps % args.eval_every == 0 and train_steps > 0:
                 eval_start_time = time()
                 save_dir = os.path.join(experiment_dir, str(train_steps))
-                sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond)
+                # sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond)
+                sim_score = evaluate_ours(ema, tokenizer, diffusion, dataloaders['valid'], rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond)
                 dist.barrier()
                 eval_end_time = time()
                 eval_time = eval_end_time - eval_start_time
@@ -360,6 +446,77 @@ def main(args):
 
     logger.info("Done!")
     cleanup()
+
+@torch.no_grad
+def evaluate_ours(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond):
+    # sampler = DistributedSampler(
+    #     test_dataloaders,
+    #     num_replicas=dist.get_world_size(),
+    #     rank=rank,
+    #     shuffle=True,
+    #     seed=seed
+    # )
+    # loader = DataLoader(
+    #     test_dataloaders,
+    #     batch_size=batch_size,
+    #     shuffle=False,
+    #     sampler=sampler,
+    #     num_workers=num_workers,
+    #     pin_memory=True,
+    #     drop_last=True
+    # )
+    from dreamsim import dreamsim
+    eval_model, _ = dreamsim(pretrained=True)
+    score = torch.tensor(0.).to(device)
+    n_samples = torch.tensor(0).to(device)
+
+    # Run for 1 step
+    # for x, y, rel_t in loader:
+    for x, y, z in tqdm(test_dataloaders, desc=f"Eval [valid]", disable=(rank != 0), total=len(test_dataloaders)):
+        x = x['visual']
+        x = x.to(device)
+        y = y.to(device)
+        y = torch.zeros(y.shape[0], y.shape[1] - num_cond, 3).to(device)
+        rel_t = torch.zeros(y.shape[0], 1).to(device).flatten(0, 1)
+        # rel_t = rel_t.to(device).flatten(0, 1)
+        with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+            B, T = x.shape[:2]
+            num_goals = T - num_cond
+            samples = model_forward_wrapper_ours(
+                (model, diffusion, vae), 
+                x, 
+                y, 
+                num_timesteps=None, 
+                latent_size=latent_size, 
+                device=device, 
+                num_cond=num_cond, 
+                num_goals=num_goals, 
+                rel_t=rel_t
+            )
+            x_start_pixels = x[:, num_cond:].flatten(0, 1)
+            x_cond_pixels = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
+            samples = samples * 0.5 + 0.5
+            x_start_pixels = x_start_pixels * 0.5 + 0.5
+            x_cond_pixels = x_cond_pixels * 0.5 + 0.5
+            res = eval_model(x_start_pixels, samples)
+            score += res.sum()
+            n_samples += len(res)
+        break
+    
+    if rank == 0:
+        os.makedirs(save_dir, exist_ok=True)
+        for i in range(min(samples.shape[0], 10)):
+            _, ax = plt.subplots(1,3,dpi=256)
+            ax[0].imshow((x_cond_pixels[i, -1].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
+            ax[1].imshow((x_start_pixels[i].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
+            ax[2].imshow((samples[i].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
+            plt.savefig(f'{save_dir}/{i}.png')
+            plt.close()
+
+    dist.all_reduce(score)
+    dist.all_reduce(n_samples)
+    sim_score = score/n_samples
+    return sim_score
 
 
 @torch.no_grad
