@@ -32,6 +32,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from diffusers.models import AutoencoderKL
+import torch.nn.functional as F
 
 from distributed import init_distributed
 from models import CDiT_models
@@ -43,6 +44,28 @@ from misc import transform
 # sys.path.insert(0,'/home/gaoyuezhou/dev/dino_wm_private_hierarchical')
 
 from datasets.pusht_dset import PushTDataset, load_pusht_slice_train_val
+
+def rotate_data(x, y, rel_t):
+    """
+    Rotates all images in x by 0, 90, 180, and 270 degrees.
+    x: (B, T, C, H, W)
+    y: (B, ...)
+    rel_t: (B, ...)
+    Returns:
+        x_rot: (4*B, T, C, H, W)
+        y_rot: (4*B, ...)
+        rel_t_rot: (4*B, ...)
+    """
+    # Rotations: 0, 90, 180, 270 degrees
+    x_list = [x]
+    for k in [1, 2, 3]:
+        # Rotate each image in the batch by k*90 degrees (dim -1 and -2 are H, W)
+        x_rot = torch.rot90(x, k=k, dims=(-2, -1))
+        x_list.append(x_rot)
+    x_rot = torch.cat(x_list, dim=0)  # (4*B, T, C, H, W)
+    y_rot = y.repeat(4, *[1 for _ in range(y.dim()-1)])
+    rel_t_rot = rel_t.repeat(4, *[1 for _ in range(rel_t.dim()-1)])
+    return x_rot, y_rot, rel_t_rot
 
 
 #################################################################################
@@ -148,6 +171,28 @@ def main(args):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     lr = float(config.get('lr', 1e-4))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
+
+    # -------- Independent decoder fine-tuning setup --------
+    finetune_decoder = bool(config.get('finetune_decoder', False))
+    # Freeze entire VAE by default
+    for p in tokenizer.parameters():
+        p.requires_grad = False
+    decoder_optimizer = None
+    if finetune_decoder:
+        decoder_params = []
+        if hasattr(tokenizer, "decoder"):
+            for p in tokenizer.decoder.parameters():
+                p.requires_grad = True
+            decoder_params += list(tokenizer.decoder.parameters())
+            tokenizer.decoder.train()
+        if hasattr(tokenizer, "post_quant_conv"):
+            for p in tokenizer.post_quant_conv.parameters():
+                p.requires_grad = True
+            decoder_params += list(tokenizer.post_quant_conv.parameters())
+            tokenizer.post_quant_conv.train()
+        decoder_lr = float(config.get('decoder_lr', 3e-4))
+        decoder_optimizer = torch.optim.AdamW(decoder_params, lr=decoder_lr, weight_decay=0)
+        
 
     bfloat_enable = bool(hasattr(args, 'bfloat16') and args.bfloat16)
     if bfloat_enable:
@@ -336,6 +381,8 @@ def main(args):
     running_loss = 0
     start_time = time()
 
+    data_augmentation = bool(config.get('data_augmentation', False))
+
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
@@ -351,10 +398,11 @@ def main(args):
             # change y to all zeros
             y = torch.zeros(y.shape[0], y.shape[1], 3).to(device)
             rel_t = torch.zeros(y.shape[0], 1).to(device)
-            # count += 1
-            # print(f'count: ', count)
-            # import pdb; pdb.set_trace()
             # rel_t = rel_t.to(device, non_blocking=True)
+            if data_augmentation:
+                x, y, rel_t = rotate_data(x, y, rel_t)
+
+            x_img = x  # keep reference to original images for reconstruction
             
             with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
                 with torch.no_grad():
@@ -363,19 +411,32 @@ def main(args):
                     x = x.flatten(0,1)
                     x = tokenizer.encode(x).latent_dist.sample().mul_(0.18215) # _, 4, 28, 28
                     x = x.unflatten(0, (B, T))
-                
-                num_goals = T - num_cond
-                x_start = x[:, num_cond:].flatten(0, 1)
-                x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
-                # y = y.flatten(0, 1)
-                y = y[:, num_cond:].flatten(0, 1)
-                rel_t = rel_t.flatten(0, 1)
-                # import pdb; pdb.set_trace()
-                
-                t = torch.randint(0, diffusion.num_timesteps, (x_start.shape[0],), device=device)
-                model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
-                loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
-                loss = loss_dict["loss"].mean()
+
+            # ----- Decoder reconstruction (independent loss/optimizer) -----
+            if finetune_decoder:
+                latents_flat = x.flatten(0, 1)  # (B*T, 4, H/8, W/8)
+                # Unscale before decoding as SD VAE expects latents scaled by 1/0.18215
+                recon_flat = tokenizer.decode(latents_flat / 0.18215).sample  # (B*T, C, H, W)
+                recon = recon_flat.unflatten(0, (B, T))
+                decoder_loss = F.l1_loss(recon, x_img)
+
+                # Separate decoder optimizer step
+                decoder_optimizer.zero_grad(set_to_none=True)
+                decoder_loss.backward()
+                decoder_optimizer.step()
+
+            num_goals = T - num_cond
+            x_start = x[:, num_cond:].flatten(0, 1)
+            x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
+            # y = y.flatten(0, 1)
+            y = y[:, num_cond:].flatten(0, 1)
+            rel_t = rel_t.flatten(0, 1)
+            # import pdb; pdb.set_trace()
+
+            t = torch.randint(0, diffusion.num_timesteps, (x_start.shape[0],), device=device)
+            model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
+            loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
+            loss = loss_dict["loss"].mean()
 
             opt.zero_grad()
             if not bfloat_enable:
@@ -405,7 +466,14 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
+                if finetune_decoder:
+                    try:
+                        dec_l1 = float(decoder_loss.item())
+                    except Exception:
+                        dec_l1 = float('nan')
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Dec L1: {dec_l1:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
+                else:
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -422,6 +490,12 @@ def main(args):
                         "epoch": epoch,
                         "train_steps": train_steps
                     }
+                    # Save decoder and post_quant_conv weights if finetuning
+                    if finetune_decoder:
+                        if hasattr(tokenizer, "decoder") and tokenizer.decoder is not None:
+                            checkpoint["vae_decoder"] = tokenizer.decoder.state_dict()
+                        if hasattr(tokenizer, "post_quant_conv") and tokenizer.post_quant_conv is not None:
+                            checkpoint["vae_post_quant_conv"] = tokenizer.post_quant_conv.state_dict()
                     if bfloat_enable:
                         checkpoint.update({"scaler": scaler.state_dict()})
                     checkpoint_path = f"{checkpoint_dir}/latest.pth.tar"
@@ -448,23 +522,20 @@ def main(args):
     cleanup()
 
 @torch.no_grad
-def evaluate_ours(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond):
-    # sampler = DistributedSampler(
-    #     test_dataloaders,
-    #     num_replicas=dist.get_world_size(),
-    #     rank=rank,
-    #     shuffle=True,
-    #     seed=seed
-    # )
-    # loader = DataLoader(
-    #     test_dataloaders,
-    #     batch_size=batch_size,
-    #     shuffle=False,
-    #     sampler=sampler,
-    #     num_workers=num_workers,
-    #     pin_memory=True,
-    #     drop_last=True
-    # )
+def evaluate_ours(
+    model, vae, diffusion, 
+    test_dataloaders, 
+    rank, 
+    batch_size, 
+    num_workers, 
+    latent_size, 
+    device, 
+    save_dir, 
+    seed, 
+    bfloat_enable, 
+    num_cond
+):  
+    num_samples_eval = 10
     from dreamsim import dreamsim
     eval_model, _ = dreamsim(pretrained=True)
     score = torch.tensor(0.).to(device)
@@ -482,7 +553,7 @@ def evaluate_ours(model, vae, diffusion, test_dataloaders, rank, batch_size, num
         with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
             B, T = x.shape[:2]
             num_goals = T - num_cond
-            samples = model_forward_wrapper_ours(
+            samples_ddim_interp = model_forward_wrapper_ours(
                 (model, diffusion, vae), 
                 x, 
                 y, 
@@ -491,26 +562,107 @@ def evaluate_ours(model, vae, diffusion, test_dataloaders, rank, batch_size, num
                 device=device, 
                 num_cond=num_cond, 
                 num_goals=num_goals, 
-                rel_t=rel_t
+                rel_t=rel_t,
+                num_samples=num_samples_eval,
+                noise_interp=True, 
+                use_ddim=True, 
             )
+            samples_ddim_rand = model_forward_wrapper_ours(
+                (model, diffusion, vae), 
+                x, 
+                y, 
+                num_timesteps=None, 
+                latent_size=latent_size, 
+                device=device, 
+                num_cond=num_cond, 
+                num_goals=num_goals, 
+                rel_t=rel_t,
+                num_samples=num_samples_eval,
+                noise_interp=False,  
+                use_ddim=True,  
+            )
+            samples_ddpm_rand = model_forward_wrapper_ours(
+                (model, diffusion, vae), 
+                x, 
+                y, 
+                num_timesteps=None, 
+                latent_size=latent_size, 
+                device=device, 
+                num_cond=num_cond, 
+                num_goals=num_goals, 
+                rel_t=rel_t,
+                num_samples=num_samples_eval,
+                noise_interp=False, 
+                use_ddim=False,  
+            )
+            # samples shape: (B*num_goals, num_samples, 3, H, W)
             x_start_pixels = x[:, num_cond:].flatten(0, 1)
             x_cond_pixels = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
-            samples = samples * 0.5 + 0.5
+            
             x_start_pixels = x_start_pixels * 0.5 + 0.5
             x_cond_pixels = x_cond_pixels * 0.5 + 0.5
-            res = eval_model(x_start_pixels, samples)
+            samples_ddim_interp = samples_ddim_interp * 0.5 + 0.5
+            samples_ddim_rand = samples_ddim_rand * 0.5 + 0.5
+            samples_ddpm_rand = samples_ddpm_rand * 0.5 + 0.5  # normalize all samples for plotting
+
+            samples_for_score = samples_ddpm_rand[:, 0]  # (B*num_goals, 3, 224, 224)
+            res = eval_model(x_start_pixels, samples_for_score)
             score += res.sum()
             n_samples += len(res)
         break
     
     if rank == 0:
         os.makedirs(save_dir, exist_ok=True)
-        for i in range(min(samples.shape[0], 10)):
-            _, ax = plt.subplots(1,3,dpi=256)
-            ax[0].imshow((x_cond_pixels[i, -1].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
-            ax[1].imshow((x_start_pixels[i].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
-            ax[2].imshow((samples[i].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
-            plt.savefig(f'{save_dir}/{i}.png')
+        for i in range(min(samples_ddim_rand.shape[0], 10)):
+            # Create a 2-row plot: first row shows [context, GT], second row shows all num_samples predictions
+            num_samples_plot = samples_ddim_rand.shape[1]  # number of sample predictions
+            _, ax = plt.subplots(4, max(2, num_samples_plot), figsize=(3*max(2, num_samples_plot), 12), dpi=128)
+            
+            # First row: context (last frame), ground truth, and avg DDIM random sample
+            ax[0, 0].imshow((x_cond_pixels[i, -1].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
+            ax[0, 0].set_title('Context')
+            ax[0, 0].axis('off')
+
+            ax[0, 1].imshow((x_start_pixels[i].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
+            ax[0, 1].set_title('Ground Truth')
+            ax[0, 1].axis('off')
+
+            # Third image: averaged DDIM random sample
+            avg_ddim_rand = samples_ddim_rand[i].mean(dim=0)
+            ax[0, 2].imshow((avg_ddim_rand.permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
+            ax[0, 2].set_title('Avg DDIM Rand')
+            ax[0, 2].axis('off')
+
+            # 4th image: averaged DDPM random sample
+            avg_ddpm_rand = samples_ddpm_rand[i].mean(dim=0)
+            ax[0, 3].imshow((avg_ddpm_rand.permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
+            ax[0, 3].set_title('Avg DDPM Rand')
+            ax[0, 3].axis('off')
+
+            # Hide remaining subplots in first row if num_samples > 4
+            for j in range(4, max(4, num_samples_plot)):
+                ax[0, j].axis('off')
+            
+            # Second row: all DDIM interp samples
+            for j in range(num_samples_plot):
+                ax[1, j].imshow((samples_ddim_interp[i, j].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
+                ax[1, j].set_title(f'DDIM interp {j+1}')
+                ax[1, j].axis('off')
+
+            # Third row: all DDIM rand samples
+            for j in range(num_samples_plot):
+                ax[2, j].imshow((samples_ddim_rand[i, j].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
+                ax[2, j].set_title(f'DDIM rand {j+1}')
+                ax[2, j].axis('off')
+
+            # Fourth row: all DDPM rand samples
+            for j in range(num_samples_plot):
+                ax[3, j].imshow((samples_ddpm_rand[i, j].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
+                ax[3, j].set_title(f'DDPM rand {j+1}')
+                ax[3, j].axis('off')
+
+            plt.tight_layout()
+            plt.savefig(f'{save_dir}/{i}.png', bbox_inches='tight')
             plt.close()
 
     dist.all_reduce(score)

@@ -75,7 +75,31 @@ def model_forward_wrapper_ours(
         rel_t=None, 
         progress=False,
         num_samples=5,
+        noise_interp=False,
+        use_ddim=False,
+        ddim_eta=0.0,
     ):
+    """
+    Forward pass through the model with optional DDIM sampling.
+    
+    Args:
+        use_ddim (bool): If True, use DDIM sampling instead of DDPM.
+                        DDIM is faster (can skip steps) and deterministic when eta=0.
+        ddim_eta (float): Controls stochasticity in DDIM sampling.
+                         - eta=0.0: Deterministic sampling (recommended for inference)
+                         - eta=1.0: Equivalent to DDPM sampling
+                         - 0 < eta < 1: Interpolates between deterministic and stochastic
+    
+    Usage examples:
+        # Standard DDPM sampling (default):
+        samples = model_forward_wrapper_ours(models, obs, delta, ...)
+        
+        # Fast deterministic DDIM sampling:
+        samples = model_forward_wrapper_ours(models, obs, delta, ..., use_ddim=True, ddim_eta=0.0)
+        
+        # Stochastic DDIM sampling:
+        samples = model_forward_wrapper_ours(models, obs, delta, ..., use_ddim=True, ddim_eta=0.5)
+    """
     model, diffusion, vae = all_models
     x = curr_obs.to(device)
     y = curr_delta.to(device)
@@ -97,17 +121,48 @@ def model_forward_wrapper_ours(
         y = y.unsqueeze(1).expand(B*num_goals, num_samples, -1).flatten(0, 1)
         rel_t = rel_t.unsqueeze(1).expand(B, num_samples).flatten(0, 1)
         
-        z = torch.randn(B*num_goals*num_samples, 4, latent_size, latent_size, device=device)
-        model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)      
-        samples = diffusion.p_sample_loop(
-                model.forward, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=progress, device=device
-        )
+        # Sample noise: either interpolate between two noises or sample independently
+        if noise_interp:
+            # Sample two noise vectors per (B*num_goals)
+            z0 = torch.randn(B*num_goals, 4, latent_size, latent_size, device=device)  # start noise
+            z1 = torch.randn(B*num_goals, 4, latent_size, latent_size, device=device)  # end noise
+            # z1 = z0
+            
+            # Create interpolation weights: [0, 1/(num_samples-1), 2/(num_samples-1), ..., 1]
+            if num_samples > 1:
+                alphas = torch.linspace(0, 1, num_samples, device=device).view(1, num_samples, 1, 1, 1)
+            else:
+                alphas = torch.tensor([0.5], device=device).view(1, 1, 1, 1, 1)
+            
+            # Interpolate: z_interp[i] = (1-alpha[i]) * z0 + alpha[i] * z1
+            z0_expanded = z0.unsqueeze(1)  # (B*num_goals, 1, 4, H, W)
+            z1_expanded = z1.unsqueeze(1)  # (B*num_goals, 1, 4, H, W)
+            z_interp = (1 - alphas) * z0_expanded + alphas * z1_expanded  # (B*num_goals, num_samples, 4, H, W)
+            z = z_interp.flatten(0, 1)  # (B*num_goals*num_samples, 4, H, W)
+        else:
+            # Independent noise sampling (original behavior)
+            z = torch.randn(B*num_goals*num_samples, 4, latent_size, latent_size, device=device)
+        
+        model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
+        
+        # Choose between DDPM (p_sample_loop) and DDIM (ddim_sample_loop) sampling
+        if use_ddim:
+            samples = diffusion.ddim_sample_loop(
+                model.forward, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, 
+                progress=progress, device=device, eta=ddim_eta
+            )
+        else:
+            samples = diffusion.p_sample_loop(
+                model.forward, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, 
+                progress=progress, device=device
+            )
+        
         samples = vae.decode(samples / 0.18215).sample  # (B*num_goals*num_samples, 3, 224, 224)
         samples = torch.clip(samples, -1., 1.)
         
         # Reshape to (B*num_goals, num_samples, 3, 224, 224) and average over num_samples
         samples = samples.unflatten(0, (B*num_goals, num_samples))
-        samples = samples.mean(dim=1)  # (B*num_goals, 3, 224, 224)
+        # samples = samples.mean(dim=1)  # (B*num_goals, 3, 224, 224)
 
         return samples
     

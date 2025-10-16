@@ -1,4 +1,4 @@
-run_name: pusht_noise_8nodes
+run_name: data_aug_4nodes
 
 # training setup
 results_dir: /checkpoint/amaia/video/gzhou/exps/nwm/logs
@@ -23,6 +23,9 @@ distance:
 
 # action output params
 len_traj_pred: 64
+
+finetune_decoder: true
+data_augmentation: true
 
 # dataset specific parameters
 image_size: 224
