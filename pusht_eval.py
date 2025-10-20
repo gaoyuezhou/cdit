@@ -13,7 +13,7 @@ import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 
 from distributed import init_distributed
-from models import CDiT_models
+from models_nwm import CDiT_models
 from diffusion import create_diffusion
 
 # PushT dataset utilities (same as train.py)

@@ -18,7 +18,7 @@ from diffusers.models import AutoencoderKL
 
 import misc
 import distributed as dist
-from models import CDiT_models
+from models_nwm import CDiT_models
 from datasets_nwm import EvalDataset
 from PIL import Image
 

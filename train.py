@@ -35,7 +35,7 @@ from diffusers.models import AutoencoderKL
 import torch.nn.functional as F
 
 from distributed import init_distributed
-from models import CDiT_models
+from models_nwm import CDiT_models
 from diffusion import create_diffusion
 from datasets_nwm import TrainingDataset
 from misc import transform
