@@ -1,0 +1,48 @@
+run_name: xl_img64_droid
+
+# training setup
+results_dir: /checkpoint/amaia/video/gzhou/exps/nwm/logs
+use_wandb: True # set to false if you don't want to log to wandb
+train: True
+batch_size: 1
+num_workers: 12
+model: CDiT-XL/2
+lr: 8e-5
+cross_attend: 0
+
+# normalization for the action space
+normalize: True
+grad_clip_val: 10.0
+# context
+context_size: 1
+
+# distance bounds for distance and action and distance predictions
+distance:
+  min_dist_cat: -64
+  max_dist_cat: 64
+
+# action output params
+len_traj_pred: 64
+
+finetune_decoder: true
+data_augmentation: false
+within_radius: false
+abs_frameskip: 25
+
+# environment: "pusht" or "droid"
+env: droid
+droid:
+  train_data_path: /checkpoint/amaia/video/basileterv/data/droid/droid_train_paths_cw.csv
+  val_data_path: /checkpoint/amaia/video/basileterv/data/droid/droid_val_paths_cw.csv
+  camera_views: ["left_mp4_path"]
+  camera_frame: true
+  n_rollout: 10
+
+# dataset specific parameters
+image_size: 64
+datasets:
+  recon:
+    data_folder: /checkpoint/amaia/video/amirbar/processed_datasets/recon
+    train: data_splits/recon/train/ # path to train folder with traj_names.txt
+    test: data_splits/recon/test/ # path to test folder with traj_names.txt
+    goals_per_obs: 1 # how many goals are sampled per observation

@@ -44,6 +44,7 @@ from misc import transform
 # sys.path.insert(0,'/home/gaoyuezhou/dev/dino_wm_private_hierarchical')
 
 from datasets.pusht_dset import PushTDataset, load_pusht_slice_train_val
+from datasets.droid_dset import load_droid_slice_train_val
 
 def rotate_data(x, y, rel_t):
     """
@@ -128,7 +129,7 @@ def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
-    _, rank, device, _ = init_distributed()
+    _, rank, device, _ = init_distributed(port=37126)
 
     print(f"[Rank {dist.get_rank()}] Node: {os.uname().nodename}, "
       f"LOCAL_RANK={os.environ.get('LOCAL_RANK')}, "
@@ -208,7 +209,9 @@ def main(args):
             raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
         latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
         print("Loading model from ", latest_path)
-        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False) 
+        # latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
+        latest_checkpoint = torch.load(latest_path, map_location='cpu', weights_only=False)
+        print("### Loaded checkpoint !!!!!")
 
         if "model" in latest_checkpoint:
             model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
@@ -321,19 +324,48 @@ def main(args):
     logger.info(f"Dataset contains {len(train_dataset):,} images")
 
     from datasets.img_transforms import default_transform
-    transform2 = default_transform()
-    datasets, traj_dsets = load_pusht_slice_train_val(
-        data_path = '/checkpoint/amaia/video/gzhou/datasets/pusht_noise', 
-        with_velocity=True,
-        normalizer_type='mean_std', # doesn't matter
-        use_sin_cos=True,
-        n_rollout=None,
-        num_hist=1,
-        num_pred=1,
-        frameskip=25,
-        transform=transform2,
-        state_based=False,
-    )
+    transform2 = default_transform(img_size=config['image_size'])
+
+    env = config.get('env', 'pusht')
+    abs_frameskip = config.get('abs_frameskip', 25)
+    within_radius = config.get('within_radius', False)
+    if within_radius:
+        num_pred = 5
+        frameskip = abs_frameskip // num_pred
+    else:
+        num_pred = 1
+        frameskip = abs_frameskip
+
+    if env == 'pusht':
+        datasets, traj_dsets = load_pusht_slice_train_val(
+            # data_path = '/checkpoint/amaia/video/gzhou/datasets/pusht_noise',
+            data_path = '/checkpoint/amaia/video/gzhou/datasets/pusht_noise_notarget',
+            # data_path = '/checkpoint/amaia/video/gzhou/datasets/pusht_multitask_no_target_noise_split',
+            with_velocity=True,
+            normalizer_type='mean_std', # doesn't matter
+            use_sin_cos=True,
+            n_rollout=None,
+            num_hist=1,
+            num_pred=num_pred,
+            frameskip=frameskip,
+            transform=transform2,
+            state_based=False,
+        )
+    elif env == 'droid':
+        droid_cfg = config['droid']
+        datasets, traj_dsets = load_droid_slice_train_val(
+            transform=transform2,
+            train_data_path=droid_cfg['train_data_path'],
+            val_data_path=droid_cfg['val_data_path'],
+            camera_views=droid_cfg.get('camera_views', ['left_mp4_path']),
+            num_hist=1,
+            num_pred=num_pred,
+            frameskip=frameskip,
+            camera_frame=droid_cfg.get('camera_frame', True),
+            n_rollout=droid_cfg.get('n_rollout', None),
+        )
+    else:
+        raise ValueError(f"Unknown env: {env}")
     # dataloaders = {
     #     x: torch.utils.data.DataLoader(
     #         datasets[x],
@@ -356,10 +388,14 @@ def main(args):
         for x in ["train", "valid"]
     }
 
+    batch_sizes = {
+        "train": config['batch_size'],
+        "valid": 5
+    }
     dataloaders = {
         x: DataLoader(
             datasets[x],
-            batch_size=config['batch_size'],
+            batch_size=batch_sizes[x],
             shuffle=False,
             sampler=samplers[x],
             num_workers=config['num_workers'],
@@ -393,12 +429,16 @@ def main(args):
         # for x, y, rel_t in tqdm(loader, desc=f"Epoch {epoch} [train]", disable=(rank != 0), total=len(loader)):
         for x, y, z in tqdm(dataloaders['train'], desc=f"Epoch {epoch} [train]", disable=(rank != 0), total=len(dataloaders['train'])):
             x = x['visual']
-            x = x.to(device, non_blocking=True) # B, T, C, H, W
-            y = y.to(device, non_blocking=True) # B, T/2, 3
+            # x = x.to(device, non_blocking=True) # B, T, C, H, W
+            # y = y.to(device, non_blocking=True) # B, T/2, 3
+
+            x = torch.cat([torch.stack([x[:, 0], x[:, j]], dim=1) for j in range(1, x.shape[1])], dim=0).to(device)
+
             # change y to all zeros
-            y = torch.zeros(y.shape[0], y.shape[1], 3).to(device)
+            y = torch.zeros(x.shape[0], x.shape[1], 3).to(device)
             rel_t = torch.zeros(y.shape[0], 1).to(device)
             # rel_t = rel_t.to(device, non_blocking=True)
+
             if data_augmentation:
                 x, y, rel_t = rotate_data(x, y, rel_t)
 
@@ -534,8 +574,9 @@ def evaluate_ours(
     seed, 
     bfloat_enable, 
     num_cond
-):  
-    num_samples_eval = 10
+):
+    # num_samples_eval = 10
+    num_samples_eval = 5
     from dreamsim import dreamsim
     eval_model, _ = dreamsim(pretrained=True)
     score = torch.tensor(0.).to(device)
@@ -545,14 +586,17 @@ def evaluate_ours(
     # for x, y, rel_t in loader:
     for x, y, z in tqdm(test_dataloaders, desc=f"Eval [valid]", disable=(rank != 0), total=len(test_dataloaders)):
         x = x['visual']
-        x = x.to(device)
-        y = y.to(device)
-        y = torch.zeros(y.shape[0], y.shape[1] - num_cond, 3).to(device)
+        # x = x.to(device)
+        # y = y.to(device)
+
+        x = torch.cat([x[:, 0:1], x[:, -1:]], dim=1).to(device)
+        y = torch.zeros(x.shape[0], x.shape[1] - num_cond, 3).to(device)
         rel_t = torch.zeros(y.shape[0], 1).to(device).flatten(0, 1)
         # rel_t = rel_t.to(device).flatten(0, 1)
         with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
             B, T = x.shape[:2]
             num_goals = T - num_cond
+            print("#### eval 1")
             samples_ddim_interp = model_forward_wrapper_ours(
                 (model, diffusion, vae), 
                 x, 
@@ -567,6 +611,7 @@ def evaluate_ours(
                 noise_interp=True, 
                 use_ddim=True, 
             )
+            print("#### eval 2")
             samples_ddim_rand = model_forward_wrapper_ours(
                 (model, diffusion, vae), 
                 x, 
@@ -581,6 +626,7 @@ def evaluate_ours(
                 noise_interp=False,  
                 use_ddim=True,  
             )
+            print("#### eval 3")
             samples_ddpm_rand = model_forward_wrapper_ours(
                 (model, diffusion, vae), 
                 x, 
@@ -616,8 +662,8 @@ def evaluate_ours(
         for i in range(min(samples_ddim_rand.shape[0], 10)):
             # Create a 2-row plot: first row shows [context, GT], second row shows all num_samples predictions
             num_samples_plot = samples_ddim_rand.shape[1]  # number of sample predictions
-            _, ax = plt.subplots(4, max(2, num_samples_plot), figsize=(3*max(2, num_samples_plot), 12), dpi=128)
-            
+            _, ax = plt.subplots(4, max(4, num_samples_plot), figsize=(3*max(4, num_samples_plot), 12), dpi=128)
+
             # First row: context (last frame), ground truth, and avg DDIM random sample
             ax[0, 0].imshow((x_cond_pixels[i, -1].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
             ax[0, 0].set_title('Context')

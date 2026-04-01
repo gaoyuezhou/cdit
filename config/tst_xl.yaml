@@ -1,0 +1,62 @@
+# run_name: data_aug_4nodes_bs1
+# run_name: xl_within_radius_4nodes_bs1_backup
+# run_name: xl_data_aug_4nodes_bs4
+# run_name: tst
+run_name: xl_img64_fixed
+
+# training setup
+results_dir: /checkpoint/amaia/video/gzhou/exps/nwm/logs
+use_wandb: True # set to false if you don't want to log to wandb
+train: True
+batch_size: 1
+num_workers: 12
+model: CDiT-XL/2
+lr: 8e-5
+cross_attend: 0
+
+# normalization for the action space
+normalize: True
+grad_clip_val: 10.0
+# context
+context_size: 1
+
+# distance bounds for distance and action and distance predictions
+distance:
+  min_dist_cat: -64
+  max_dist_cat: 64
+
+# action output params
+len_traj_pred: 64
+
+finetune_decoder: true
+data_augmentation: true
+
+# dataset specific parameters
+image_size: 64
+datasets:
+  recon:
+    data_folder: /checkpoint/amaia/video/amirbar/processed_datasets/recon
+    train: data_splits/recon/train/ # path to train folder with traj_names.txt
+    test: data_splits/recon/test/ # path to test folder with traj_names.txt
+    goals_per_obs: 1 # how many goals are sampled per observation
+  # tartan_drive:
+  #   data_folder: /checkpoint/amaia/video/amirbar/processed_datasets/tartan_320
+  #   train: /checkpoint/amaia/video/amirbar/data_splits/tartan/train/
+  #   test: /checkpoint/amaia/video/amirbar/data_splits/tartan/test/
+  #   end_slack: 3 # because many trajectories end in collisions
+  #   goals_per_obs: 1 # how many goals are sampled per observation
+  #   negative_mining: True
+  # sacson:
+  #   data_folder: /checkpoint/amaia/video/amirbar/processed_datasets/huron_320
+  #   train: /checkpoint/amaia/video/amirbar/data_splits/sascon/train
+  #   test: /checkpoint/amaia/video/amirbar/data_splits/sascon/test
+  #   end_slack: 3 # because many trajectories end in collisions
+  #   goals_per_obs: 1 # how many goals are sampled per observation
+  #   negative_mining: True
+  # scand:
+  #   data_folder: /checkpoint/amaia/video/amirbar/processed_datasets/scand_320
+  #   train: /checkpoint/amaia/video/amirbar/data_splits/scand/train
+  #   test: /checkpoint/amaia/video/amirbar/data_splits/scand/test
+  #   end_slack: 3 # because many trajectories end in collisions
+  #   goals_per_obs: 1 # how many goals are sampled per observation
+  #   negative_mining: True
